@@ -81,12 +81,8 @@ int ConvolutionDepthWise::load_param(const ParamDict& pd)
     weight_data_size = pd.get(6, 0);
     group = pd.get(7, 1);
     int8_scale_term = pd.get(8, 0);
-
-    if (pad_w == -233 && pad_h == -233)
-    {
-        // TODO
-        support_vulkan = false;
-    }
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
 
     use_int8_inference = pd.use_int8_inference;
 
@@ -692,6 +688,25 @@ int ConvolutionDepthWise::forward(const Mat& bottom_blob, Mat& top_blob, const O
                         sum += val * w;
                     }
 
+                    if (activation_type == 1)
+                    {
+                        sum = std::max(sum, 0.f);
+                    }
+                    else if (activation_type == 2)
+                    {
+                        float slope = activation_params[0];
+                        sum = sum > 0.f ? sum : sum * slope;
+                    }
+                    else if (activation_type == 3)
+                    {
+                        float min = activation_params[0];
+                        float max = activation_params[1];
+                        if (sum < min)
+                            sum = min;
+                        if (sum > max)
+                            sum = max;
+                    }
+
                     outptr[j] = sum;
                 }
 
@@ -742,6 +757,25 @@ int ConvolutionDepthWise::forward(const Mat& bottom_blob, Mat& top_blob, const O
                         }
 
                         kptr += maxk;
+                    }
+
+                    if (activation_type == 1)
+                    {
+                        sum = std::max(sum, 0.f);
+                    }
+                    else if (activation_type == 2)
+                    {
+                        float slope = activation_params[0];
+                        sum = sum > 0.f ? sum : sum * slope;
+                    }
+                    else if (activation_type == 3)
+                    {
+                        float min = activation_params[0];
+                        float max = activation_params[1];
+                        if (sum < min)
+                            sum = min;
+                        if (sum > max)
+                            sum = max;
                     }
 
                     outptr[j] = sum;
@@ -1016,22 +1050,25 @@ int ConvolutionDepthWise::create_pipeline()
 {
     padding->create_pipeline();
 
+    std::vector<vk_specialization_type> specializations(11);
+    specializations[0].i = kernel_w;
+    specializations[1].i = kernel_h;
+    specializations[2].i = dilation_w;
+    specializations[3].i = dilation_h;
+    specializations[4].i = stride_w;
+    specializations[5].i = stride_h;
+    specializations[6].i = bias_term;
+    specializations[7].i = group;
+    specializations[8].i = activation_type;
+    specializations[9].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+    specializations[10].f = activation_params.w == 2 ? activation_params[1] : 0.f;
+
     const int maxk = kernel_w * kernel_h;
     int channels = (weight_data_size / group) / maxk / (num_output / group) * group;
 
     // depth-wise
     if (channels == group && group == num_output)
     {
-        std::vector<vk_specialization_type> specializations(8);
-        specializations[0].i = kernel_w;
-        specializations[1].i = kernel_h;
-        specializations[2].i = dilation_w;
-        specializations[3].i = dilation_h;
-        specializations[4].i = stride_w;
-        specializations[5].i = stride_h;
-        specializations[6].i = bias_term;
-        specializations[7].i = group;
-
         // pack1
         if (num_output % 4 != 0)
         {
@@ -1054,16 +1091,6 @@ int ConvolutionDepthWise::create_pipeline()
     // group convolution
     const int channels_g = channels / group;
     const int num_output_g = num_output / group;
-
-    std::vector<vk_specialization_type> specializations(8);
-    specializations[0].i = kernel_w;
-    specializations[1].i = kernel_h;
-    specializations[2].i = dilation_w;
-    specializations[3].i = dilation_h;
-    specializations[4].i = stride_w;
-    specializations[5].i = stride_h;
-    specializations[6].i = bias_term;
-    specializations[7].i = group;
 
     // pack1
     if (channels_g % 4 != 0 && num_output_g % 4 != 0)
@@ -1160,6 +1187,36 @@ int ConvolutionDepthWise::forward(const VkMat& bottom_blob, VkMat& top_blob, VkC
         opt_pad.blob_vkallocator = opt.workspace_vkallocator;
 
         padding->forward(bottom_blob, bottom_blob_bordered, cmd, opt_pad);
+
+        w = bottom_blob_bordered.w;
+        h = bottom_blob_bordered.h;
+    }
+    else if (pad_w == -233 && pad_h == -233)
+    {
+        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
+        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
+        if (wpad > 0 || hpad > 0)
+        {
+            ncnn::Option opt_pad = opt;
+            opt_pad.blob_vkallocator = opt.workspace_vkallocator;
+
+            VkMat padding_param_blob(4, (size_t)4u, 1, opt.staging_vkallocator, opt.staging_vkallocator);
+            padding_param_blob.prepare_staging_buffer();
+            int* padding_params = padding_param_blob.mapped();
+
+            padding_params[0] = hpad / 2;
+            padding_params[1] = hpad - hpad / 2;
+            padding_params[2] = wpad / 2;
+            padding_params[3] = wpad - wpad / 2;
+
+            std::vector<VkMat> padding_inputs(2);
+            padding_inputs[0] = bottom_blob;
+            padding_inputs[1] = padding_param_blob;
+
+            std::vector<VkMat> padding_outputs(1);
+            padding->forward(padding_inputs, padding_outputs, cmd, opt_pad);
+            bottom_blob_bordered = padding_outputs[0];
+        }
 
         w = bottom_blob_bordered.w;
         h = bottom_blob_bordered.h;

@@ -64,6 +64,8 @@ int DeconvolutionDepthWise::load_param(const ParamDict& pd)
     bias_term = pd.get(5, 0);
     weight_data_size = pd.get(6, 0);
     group = pd.get(7, 1);
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
 
 #if NCNN_VULKAN
     if (pd.use_vulkan_compute)
@@ -211,6 +213,44 @@ int DeconvolutionDepthWise::forward(const Mat& bottom_blob, Mat& top_blob, const
                     }
                 }
             }
+
+
+            if (activation_type == 1)
+            {
+                float* outptr = m;
+                int size = outw * outh;
+
+                for (int i = 0; i < size; i++)
+                {
+                    outptr[i] = std::max(outptr[i], 0.f);
+                }
+            }
+            else if (activation_type == 2)
+            {
+                float* outptr = m;
+                int size = outw * outh;
+                float slope = activation_params[0];
+
+                for (int i = 0; i < size; i++)
+                {
+                    outptr[i] = outptr[i] > 0.f ? outptr[i] : outptr[i] * slope;
+                }
+            }
+            else if (activation_type == 3)
+            {
+                float* outptr = m;
+                int size = outw * outh;
+                float min = activation_params[0];
+                float max = activation_params[1];
+
+                for (int i = 0; i < size; i++)
+                {
+                    if (outptr[i] < min)
+                        outptr[i] = min;
+                    if (outptr[i] > max)
+                        outptr[i] = max;
+                }
+            }
         }
     }
     else
@@ -256,6 +296,43 @@ int DeconvolutionDepthWise::forward(const Mat& bottom_blob, Mat& top_blob, const
 
                             kptr += maxk;
                         }
+                    }
+                }
+
+                if (activation_type == 1)
+                {
+                    float* outptr = out;
+                    int size = outw * outh;
+
+                    for (int i = 0; i < size; i++)
+                    {
+                        outptr[i] = std::max(outptr[i], 0.f);
+                    }
+                }
+                else if (activation_type == 2)
+                {
+                    float* outptr = out;
+                    int size = outw * outh;
+                    float slope = activation_params[0];
+
+                    for (int i = 0; i < size; i++)
+                    {
+                        outptr[i] = outptr[i] > 0.f ? outptr[i] : outptr[i] * slope;
+                    }
+                }
+                else if (activation_type == 3)
+                {
+                    float* outptr = out;
+                    int size = outw * outh;
+                    float min = activation_params[0];
+                    float max = activation_params[1];
+
+                    for (int i = 0; i < size; i++)
+                    {
+                        if (outptr[i] < min)
+                            outptr[i] = min;
+                        if (outptr[i] > max)
+                            outptr[i] = max;
                     }
                 }
             }
@@ -559,22 +636,25 @@ int DeconvolutionDepthWise::create_pipeline()
 {
     crop->create_pipeline();
 
+    std::vector<vk_specialization_type> specializations(11);
+    specializations[0].i = kernel_w;
+    specializations[1].i = kernel_h;
+    specializations[2].i = dilation_w;
+    specializations[3].i = dilation_h;
+    specializations[4].i = stride_w;
+    specializations[5].i = stride_h;
+    specializations[6].i = bias_term;
+    specializations[7].i = group;
+    specializations[8].i = activation_type;
+    specializations[9].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+    specializations[10].f = activation_params.w == 2 ? activation_params[1] : 0.f;
+
     const int maxk = kernel_w * kernel_h;
     int channels = (weight_data_size / group) / maxk / (num_output / group) * group;
 
     // depth-wise
     if (channels == group && group == num_output)
     {
-        std::vector<vk_specialization_type> specializations(8);
-        specializations[0].i = kernel_w;
-        specializations[1].i = kernel_h;
-        specializations[2].i = dilation_w;
-        specializations[3].i = dilation_h;
-        specializations[4].i = stride_w;
-        specializations[5].i = stride_h;
-        specializations[6].i = bias_term;
-        specializations[7].i = group;
-
         // pack1
         if (num_output % 4 != 0)
         {
@@ -597,16 +677,6 @@ int DeconvolutionDepthWise::create_pipeline()
     // group deconvolution
     const int channels_g = channels / group;
     const int num_output_g = num_output / group;
-
-    std::vector<vk_specialization_type> specializations(8);
-    specializations[0].i = kernel_w;
-    specializations[1].i = kernel_h;
-    specializations[2].i = dilation_w;
-    specializations[3].i = dilation_h;
-    specializations[4].i = stride_w;
-    specializations[5].i = stride_h;
-    specializations[6].i = bias_term;
-    specializations[7].i = group;
 
     // pack1
     if (channels_g % 4 != 0 && num_output_g % 4 != 0)

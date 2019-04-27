@@ -13,7 +13,7 @@
 // specific language governing permissions and limitations under the License.
 
 #include "innerproduct.h"
-
+#include <algorithm>
 #include "layer_type.h"
 
 namespace ncnn {
@@ -58,6 +58,8 @@ int InnerProduct::load_param(const ParamDict& pd)
     bias_term = pd.get(1, 0);
     weight_data_size = pd.get(2, 0);
     int8_scale_term = pd.get(8, 0);
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
 
     use_int8_inference = pd.use_int8_inference;
 
@@ -270,6 +272,25 @@ int InnerProduct::forward(const Mat& bottom_blob, Mat& top_blob, const Option& o
             }
         }
 
+        if (activation_type == 1)
+        {
+            sum = std::max(sum, 0.f);
+        }
+        else if (activation_type == 2)
+        {
+            float slope = activation_params[0];
+            sum = sum > 0.f ? sum : sum * slope;
+        }
+        else if (activation_type == 3)
+        {
+            float min = activation_params[0];
+            float max = activation_params[1];
+            if (sum < min)
+                sum = min;
+            if (sum > max)
+                sum = max;
+        }
+
         top_blob[p] = sum;
     }
 
@@ -436,8 +457,11 @@ int InnerProduct::create_pipeline()
 
     int num_input = weight_data_size / num_output;
 
-    std::vector<vk_specialization_type> specializations(1);
+    std::vector<vk_specialization_type> specializations(4);
     specializations[0].i = bias_term;
+    specializations[1].i = activation_type;
+    specializations[2].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+    specializations[3].f = activation_params.w == 2 ? activation_params[1] : 0.f;
 
     // pack1
     if (num_input % 4 != 0 && num_output % 4 != 0)

@@ -55,6 +55,8 @@ int Deconvolution::load_param(const ParamDict& pd)
     pad_h = pd.get(14, pad_w);
     bias_term = pd.get(5, 0);
     weight_data_size = pd.get(6, 0);
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
 
 #if NCNN_VULKAN
     if (pd.use_vulkan_compute)
@@ -180,6 +182,43 @@ int Deconvolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& 
 
                     kptr += maxk;
                 }
+            }
+        }
+
+        if (activation_type == 1)
+        {
+            float* outptr = out;
+            int size = outw * outh;
+
+            for (int i = 0; i < size; i++)
+            {
+                outptr[i] = std::max(outptr[i], 0.f);
+            }
+        }
+        else if (activation_type == 2)
+        {
+            float* outptr = out;
+            int size = outw * outh;
+            float slope = activation_params[0];
+
+            for (int i = 0; i < size; i++)
+            {
+                outptr[i] = outptr[i] > 0.f ? outptr[i] : outptr[i] * slope;
+            }
+        }
+        else if (activation_type == 3)
+        {
+            float* outptr = out;
+            int size = outw * outh;
+            float min = activation_params[0];
+            float max = activation_params[1];
+
+            for (int i = 0; i < size; i++)
+            {
+                if (outptr[i] < min)
+                    outptr[i] = min;
+                if (outptr[i] > max)
+                    outptr[i] = max;
             }
         }
     }
@@ -419,7 +458,7 @@ int Deconvolution::create_pipeline()
     const int maxk = kernel_w * kernel_h;
     int num_input = weight_data_size / maxk / num_output;
 
-    std::vector<vk_specialization_type> specializations(7);
+    std::vector<vk_specialization_type> specializations(10);
     specializations[0].i = kernel_w;
     specializations[1].i = kernel_h;
     specializations[2].i = dilation_w;
@@ -427,6 +466,9 @@ int Deconvolution::create_pipeline()
     specializations[4].i = stride_w;
     specializations[5].i = stride_h;
     specializations[6].i = bias_term;
+    specializations[7].i = activation_type;
+    specializations[8].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+    specializations[9].f = activation_params.w == 2 ? activation_params[1] : 0.f;
 
     // pack1
     if (num_input % 4 != 0 && num_output % 4 != 0)

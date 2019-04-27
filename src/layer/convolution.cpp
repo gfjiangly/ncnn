@@ -79,12 +79,8 @@ int Convolution::load_param(const ParamDict& pd)
     bias_term = pd.get(5, 0);
     weight_data_size = pd.get(6, 0);
     int8_scale_term = pd.get(8, 0);
-
-    if (pad_w == -233 && pad_h == -233)
-    {
-        // TODO
-        support_vulkan = false;
-    }
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
 
     use_int8_inference = pd.use_int8_inference;
 
@@ -556,6 +552,25 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
                     kptr += maxk;
                 }
 
+                if (activation_type == 1)
+                {
+                    sum = std::max(sum, 0.f);
+                }
+                else if (activation_type == 2)
+                {
+                    float slope = activation_params[0];
+                    sum = sum > 0.f ? sum : sum * slope;
+                }
+                else if (activation_type == 3)
+                {
+                    float min = activation_params[0];
+                    float max = activation_params[1];
+                    if (sum < min)
+                        sum = min;
+                    if (sum > max)
+                        sum = max;
+                }
+
                 outptr[j] = sum;
             }
 
@@ -769,8 +784,11 @@ int Convolution::create_pipeline()
         pipeline_convolution_1x1s1d1 = new Pipeline(vkdev);
         pipeline_convolution_1x1s1d1->set_optimal_local_size_xyz(-1, 1, std::max(1, num_output / 8));
 
-        std::vector<vk_specialization_type> specializations(1);
+        std::vector<vk_specialization_type> specializations(4);
         specializations[0].i = bias_term;
+        specializations[1].i = activation_type;
+        specializations[2].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+        specializations[3].f = activation_params.w == 2 ? activation_params[1] : 0.f;
 
         pipeline_convolution_1x1s1d1->create("convolution_1x1s1d1", specializations, 4, 8);
     }
@@ -778,7 +796,7 @@ int Convolution::create_pipeline()
     const int maxk = kernel_w * kernel_h;
     int num_input = weight_data_size / maxk / num_output;
 
-    std::vector<vk_specialization_type> specializations(7);
+    std::vector<vk_specialization_type> specializations(10);
     specializations[0].i = kernel_w;
     specializations[1].i = kernel_h;
     specializations[2].i = dilation_w;
@@ -786,6 +804,9 @@ int Convolution::create_pipeline()
     specializations[4].i = stride_w;
     specializations[5].i = stride_h;
     specializations[6].i = bias_term;
+    specializations[7].i = activation_type;
+    specializations[8].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+    specializations[9].f = activation_params.w == 2 ? activation_params[1] : 0.f;
 
     // pack1
     if (num_input % 4 != 0 && num_output % 4 != 0)
@@ -822,8 +843,11 @@ int Convolution::create_pipeline()
     // fc
     if (kernel_w == 1 && kernel_h == 1)
     {
-        std::vector<vk_specialization_type> specializations(1);
+        std::vector<vk_specialization_type> specializations(4);
         specializations[0].i = bias_term;
+        specializations[1].i = activation_type;
+        specializations[2].f = activation_params.w == 1 ? activation_params[0] : 0.f;
+        specializations[3].f = activation_params.w == 2 ? activation_params[1] : 0.f;
 
         // pack1
         if (num_input % 4 != 0 && num_output % 4 != 0)
@@ -991,6 +1015,36 @@ int Convolution::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& c
         opt_pad.blob_vkallocator = opt.workspace_vkallocator;
 
         padding->forward(bottom_blob, bottom_blob_bordered, cmd, opt_pad);
+
+        w = bottom_blob_bordered.w;
+        h = bottom_blob_bordered.h;
+    }
+    else if (pad_w == -233 && pad_h == -233)
+    {
+        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
+        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
+        if (wpad > 0 || hpad > 0)
+        {
+            ncnn::Option opt_pad = opt;
+            opt_pad.blob_vkallocator = opt.workspace_vkallocator;
+
+            VkMat padding_param_blob(4, (size_t)4u, 1, opt.staging_vkallocator, opt.staging_vkallocator);
+            padding_param_blob.prepare_staging_buffer();
+            int* padding_params = padding_param_blob.mapped();
+
+            padding_params[0] = hpad / 2;
+            padding_params[1] = hpad - hpad / 2;
+            padding_params[2] = wpad / 2;
+            padding_params[3] = wpad - wpad / 2;
+
+            std::vector<VkMat> padding_inputs(2);
+            padding_inputs[0] = bottom_blob;
+            padding_inputs[1] = padding_param_blob;
+
+            std::vector<VkMat> padding_outputs(1);
+            padding->forward(padding_inputs, padding_outputs, cmd, opt_pad);
+            bottom_blob_bordered = padding_outputs[0];
+        }
 
         w = bottom_blob_bordered.w;
         h = bottom_blob_bordered.h;
